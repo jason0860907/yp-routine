@@ -1,0 +1,121 @@
+name: 104 AI 遠端職缺日報
+
+on:
+  schedule:
+    - cron: '0 4 * * *'  # UTC 04:00 = 台灣時間中午 12:00
+  workflow_dispatch:  # 允許手動觸發
+
+jobs:
+  search-jobs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 搜尋 104 職缺並發送 Discord 通知
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          #!/bin/bash
+          set -euo pipefail
+
+          KEYWORDS=("AI" "LLM" "機器學習" "深度學習" "GenAI")
+          ALL_JOBS=""
+          SEEN_IDS=""
+          TODAY=$(TZ=Asia/Taipei date +%Y-%m-%d)
+
+          for keyword in "${KEYWORDS[@]}"; do
+            echo "搜尋關鍵字: $keyword"
+
+            RESPONSE=$(curl -s "https://www.104.com.tw/jobs/search/list?ro=1&kwop=7&keyword=${keyword}&order=15&asc=0&page=1&mode=s&jobsource=2018indexpoc&langFlag=0&langStatus=0&recommendJob=1&hotJob=1" \
+              -H "Referer: https://www.104.com.tw/jobs/search/" \
+              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              -H "Accept: application/json, text/plain, */*" || echo "")
+
+            if [ -z "$RESPONSE" ]; then
+              echo "關鍵字 $keyword 搜尋失敗，跳過"
+              continue
+            fi
+
+            # 解析 JSON 並篩選職缺
+            PARSED=$(echo "$RESPONSE" | python3 -c "
+          import json, sys
+          try:
+              data = json.load(sys.stdin)
+              jobs = data.get('data', {}).get('list', [])
+              for j in jobs:
+                  job_no = j.get('link', {}).get('job', '').replace('//www.104.com.tw/job/', '').rstrip('?')
+                  if not job_no:
+                      job_no = j.get('jobNo', '')
+                  name = j.get('jobName', '未知')
+                  company = j.get('custName', '未知')
+                  salary = j.get('salaryDesc', '面議')
+                  remote = j.get('remoteWorkType', '')
+                  tags = j.get('tags', [])
+                  appear_date = j.get('appearDate', '')
+                  # 輸出格式: jobNo|name|company|salary|remoteInfo|date
+                  print(f'{job_no}|{name}|{company}|{salary}|{remote}|{appear_date}')
+          except Exception as e:
+              print(f'ERROR: {e}', file=sys.stderr)
+          " 2>/dev/null || echo "")
+
+            while IFS='|' read -r job_no name company salary remote_info date; do
+              [ -z "$job_no" ] && continue
+              # 去重
+              if echo "$SEEN_IDS" | grep -q "$job_no"; then
+                continue
+              fi
+              SEEN_IDS="$SEEN_IDS $job_no"
+              ALL_JOBS="${ALL_JOBS}• ${name} - ${company}\n  💰 ${salary}\n  🔗 https://www.104.com.tw/job/${job_no}\n\n"
+            done <<< "$PARSED"
+
+            sleep 1  # 避免請求太頻繁
+          done
+
+          # 組裝 Discord 訊息
+          if [ -z "$ALL_JOBS" ]; then
+            MESSAGE="📋 ${TODAY} AI 遠端職缺日報\n\n今天沒有找到符合條件的遠端 AI 職缺 😢"
+          else
+            MESSAGE="📋 ${TODAY} AI 遠端職缺日報\n\n${ALL_JOBS}"
+          fi
+
+          # Discord 訊息上限 2000 字元，超過就截斷
+          send_discord() {
+            local msg="$1"
+            curl -s -H "Content-Type: application/json" \
+              -d "$(python3 -c "import json; print(json.dumps({'content': '''$msg'''}))" 2>/dev/null || echo '{"content":"訊息格式錯誤"}')" \
+              "$DISCORD_WEBHOOK"
+          }
+
+          # 用 python 處理訊息分割和發送
+          python3 << 'PYTHON'
+          import json, os, urllib.request
+
+          webhook = os.environ["DISCORD_WEBHOOK"]
+          message = """'"${MESSAGE}"'"""
+
+          # 分割訊息（每則最多 1900 字元，留點餘量）
+          chunks = []
+          current = ""
+          for line in message.split("\\n"):
+              line = line.replace("\\n", "\n") if "\\n" not in line else line
+              if len(current) + len(line) + 1 > 1900:
+                  chunks.append(current)
+                  current = line
+              else:
+                  current = current + "\n" + line if current else line
+          if current:
+              chunks.append(current)
+
+          for chunk in chunks:
+              data = json.dumps({"content": chunk}).encode("utf-8")
+              req = urllib.request.Request(
+                  webhook,
+                  data=data,
+                  headers={"Content-Type": "application/json"},
+                  method="POST"
+              )
+              try:
+                  urllib.request.urlopen(req)
+              except Exception as e:
+                  print(f"Discord 發送失敗: {e}")
+          PYTHON
+
+          echo "完成！"
