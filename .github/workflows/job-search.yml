@@ -1,9 +1,9 @@
 name: 104 AI 遠端職缺日報
 
 on:
-  schedule:
-    - cron: '0 4 * * *'  # UTC 04:00 = 台灣時間中午 12:00
-  workflow_dispatch:
+  # schedule:
+  #   - cron: '0 4 * * *'  # UTC 04:00 = 台灣時間中午 12:00
+  workflow_dispatch:  # 只保留手動觸發
 
 jobs:
   search-jobs:
