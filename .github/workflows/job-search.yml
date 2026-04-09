@@ -3,119 +3,171 @@ name: 104 AI 遠端職缺日報
 on:
   schedule:
     - cron: '0 4 * * *'  # UTC 04:00 = 台灣時間中午 12:00
-  workflow_dispatch:  # 允許手動觸發
+  workflow_dispatch:
 
 jobs:
   search-jobs:
     runs-on: ubuntu-latest
     steps:
+      - name: 安裝 Playwright
+        run: |
+          pip install playwright
+          playwright install chromium --with-deps
+
       - name: 搜尋 104 職缺並發送 Discord 通知
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
-          #!/bin/bash
-          set -euo pipefail
-
-          KEYWORDS=("AI" "LLM" "機器學習" "深度學習" "GenAI")
-          ALL_JOBS=""
-          SEEN_IDS=""
-          TODAY=$(TZ=Asia/Taipei date +%Y-%m-%d)
-
-          for keyword in "${KEYWORDS[@]}"; do
-            echo "搜尋關鍵字: $keyword"
-
-            RESPONSE=$(curl -s "https://www.104.com.tw/jobs/search/list?ro=1&kwop=7&keyword=${keyword}&order=15&asc=0&page=1&mode=s&jobsource=2018indexpoc&langFlag=0&langStatus=0&recommendJob=1&hotJob=1" \
-              -H "Referer: https://www.104.com.tw/jobs/search/" \
-              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-              -H "Accept: application/json, text/plain, */*" || echo "")
-
-            if [ -z "$RESPONSE" ]; then
-              echo "關鍵字 $keyword 搜尋失敗，跳過"
-              continue
-            fi
-
-            # 解析 JSON 並篩選職缺
-            PARSED=$(echo "$RESPONSE" | python3 -c "
-          import json, sys
-          try:
-              data = json.load(sys.stdin)
-              jobs = data.get('data', {}).get('list', [])
-              for j in jobs:
-                  job_no = j.get('link', {}).get('job', '').replace('//www.104.com.tw/job/', '').rstrip('?')
-                  if not job_no:
-                      job_no = j.get('jobNo', '')
-                  name = j.get('jobName', '未知')
-                  company = j.get('custName', '未知')
-                  salary = j.get('salaryDesc', '面議')
-                  remote = j.get('remoteWorkType', '')
-                  tags = j.get('tags', [])
-                  appear_date = j.get('appearDate', '')
-                  # 輸出格式: jobNo|name|company|salary|remoteInfo|date
-                  print(f'{job_no}|{name}|{company}|{salary}|{remote}|{appear_date}')
-          except Exception as e:
-              print(f'ERROR: {e}', file=sys.stderr)
-          " 2>/dev/null || echo "")
-
-            while IFS='|' read -r job_no name company salary remote_info date; do
-              [ -z "$job_no" ] && continue
-              # 去重
-              if echo "$SEEN_IDS" | grep -q "$job_no"; then
-                continue
-              fi
-              SEEN_IDS="$SEEN_IDS $job_no"
-              ALL_JOBS="${ALL_JOBS}• ${name} - ${company}\n  💰 ${salary}\n  🔗 https://www.104.com.tw/job/${job_no}\n\n"
-            done <<< "$PARSED"
-
-            sleep 1  # 避免請求太頻繁
-          done
-
-          # 組裝 Discord 訊息
-          if [ -z "$ALL_JOBS" ]; then
-            MESSAGE="📋 ${TODAY} AI 遠端職缺日報\n\n今天沒有找到符合條件的遠端 AI 職缺 😢"
-          else
-            MESSAGE="📋 ${TODAY} AI 遠端職缺日報\n\n${ALL_JOBS}"
-          fi
-
-          # Discord 訊息上限 2000 字元，超過就截斷
-          send_discord() {
-            local msg="$1"
-            curl -s -H "Content-Type: application/json" \
-              -d "$(python3 -c "import json; print(json.dumps({'content': '''$msg'''}))" 2>/dev/null || echo '{"content":"訊息格式錯誤"}')" \
-              "$DISCORD_WEBHOOK"
-          }
-
-          # 用 python 處理訊息分割和發送
           python3 << 'PYTHON'
-          import json, os, urllib.request
+          import asyncio, json, os, urllib.request, time
+          from datetime import datetime, timezone, timedelta
+          from playwright.async_api import async_playwright
 
-          webhook = os.environ["DISCORD_WEBHOOK"]
-          message = """'"${MESSAGE}"'"""
+          DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
+          TW = timezone(timedelta(hours=8))
+          TODAY = datetime.now(TW).strftime("%Y-%m-%d")
 
-          # 分割訊息（每則最多 1900 字元，留點餘量）
-          chunks = []
-          current = ""
-          for line in message.split("\\n"):
-              line = line.replace("\\n", "\n") if "\\n" not in line else line
-              if len(current) + len(line) + 1 > 1900:
+          SEARCHES = [
+              "AI 遠端",
+              "LLM remote",
+              "機器學習 遠端",
+              "深度學習 remote",
+              "GenAI 遠端",
+          ]
+
+          def send_discord(message: str):
+              """發送訊息到 Discord，自動分割超過 2000 字元的訊息"""
+              chunks = []
+              current = ""
+              for line in message.split("\n"):
+                  if len(current) + len(line) + 1 > 1900:
+                      chunks.append(current)
+                      current = line
+                  else:
+                      current = current + "\n" + line if current else line
+              if current:
                   chunks.append(current)
-                  current = line
-              else:
-                  current = current + "\n" + line if current else line
-          if current:
-              chunks.append(current)
 
-          for chunk in chunks:
-              data = json.dumps({"content": chunk}).encode("utf-8")
-              req = urllib.request.Request(
-                  webhook,
-                  data=data,
-                  headers={"Content-Type": "application/json"},
-                  method="POST"
-              )
+              for chunk in chunks:
+                  data = json.dumps({"content": chunk}).encode("utf-8")
+                  req = urllib.request.Request(
+                      DISCORD_WEBHOOK,
+                      data=data,
+                      headers={"Content-Type": "application/json"},
+                      method="POST",
+                  )
+                  try:
+                      urllib.request.urlopen(req)
+                      time.sleep(0.5)  # rate limit
+                  except Exception as e:
+                      print(f"Discord 發送失敗: {e}")
+
+          async def scrape_104(keyword: str, page) -> list:
+              """用 Playwright 打開 104 搜尋頁並抓取職缺"""
+              url = f"https://www.104.com.tw/jobs/search/?keyword={keyword}&ro=1&order=15&asc=0"
+              print(f"搜尋: {keyword} -> {url}")
+
               try:
-                  urllib.request.urlopen(req)
-              except Exception as e:
-                  print(f"Discord 發送失敗: {e}")
-          PYTHON
+                  await page.goto(url, wait_until="networkidle", timeout=30000)
+                  await page.wait_for_timeout(3000)  # 等 JS render
 
-          echo "完成！"
+                  # 抓取職缺列表
+                  jobs = await page.evaluate("""() => {
+                      const results = [];
+                      // 104 的職缺卡片
+                      const cards = document.querySelectorAll('article.job-list-item, article.b-block--top-bord, [data-job-no]');
+                      cards.forEach(card => {
+                          try {
+                              const linkEl = card.querySelector('a[href*="/job/"]');
+                              const nameEl = card.querySelector('a[href*="/job/"]');
+                              const companyEl = card.querySelector('a[href*="/company/"]');
+                              const salaryEl = card.querySelector('.b-tag--default, [class*="salary"], .job-list-tag span');
+
+                              if (linkEl) {
+                                  const href = linkEl.getAttribute('href') || '';
+                                  const jobNo = href.match(/\\/job\\/([\\w]+)/)?.[1] || '';
+                                  results.push({
+                                      name: nameEl?.textContent?.trim() || '未知',
+                                      company: companyEl?.textContent?.trim() || '未知',
+                                      salary: salaryEl?.textContent?.trim() || '面議',
+                                      jobNo: jobNo,
+                                      link: 'https://www.104.com.tw/job/' + jobNo
+                                  });
+                              }
+                          } catch(e) {}
+                      });
+                      return results;
+                  }""")
+
+                  # 如果上面的選擇器沒抓到，試試更通用的方式
+                  if not jobs:
+                      jobs = await page.evaluate("""() => {
+                          const results = [];
+                          const links = document.querySelectorAll('a[href*="/job/"]');
+                          const seen = new Set();
+                          links.forEach(a => {
+                              const href = a.getAttribute('href') || '';
+                              const match = href.match(/\\/job\\/(\\w+)/);
+                              if (match && !seen.has(match[1])) {
+                                  seen.add(match[1]);
+                                  // 往上找包含的區塊
+                                  const container = a.closest('article, .job-list-item, [class*="job"]') || a.parentElement;
+                                  const companyLink = container?.querySelector('a[href*="/company/"]');
+                                  results.push({
+                                      name: a.textContent?.trim() || '未知',
+                                      company: companyLink?.textContent?.trim() || '未知',
+                                      salary: '請點連結查看',
+                                      jobNo: match[1],
+                                      link: 'https://www.104.com.tw/job/' + match[1]
+                                  });
+                              }
+                          });
+                          return results;
+                      }""")
+
+                  print(f"  找到 {len(jobs)} 筆職缺")
+                  return jobs
+
+              except Exception as e:
+                  print(f"  搜尋失敗: {e}")
+                  return []
+
+          async def main():
+              all_jobs = {}  # jobNo -> job info，用來去重
+
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch(headless=True)
+                  context = await browser.new_context(
+                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                      locale="zh-TW",
+                  )
+                  page = await context.new_page()
+
+                  for keyword in SEARCHES:
+                      jobs = await scrape_104(keyword, page)
+                      for job in jobs:
+                          if job["jobNo"] and job["jobNo"] not in all_jobs:
+                              all_jobs[job["jobNo"]] = job
+                      await asyncio.sleep(2)  # 間隔避免被擋
+
+                  await browser.close()
+
+              # 組裝訊息
+              if not all_jobs:
+                  message = f"📋 {TODAY} AI 遠端職缺日報\n\n今天沒有找到符合條件的遠端 AI 職缺 😢\n\n🔍 你可以手動搜尋：https://www.104.com.tw/jobs/search/?keyword=AI+%E9%81%A0%E7%AB%AF&ro=1"
+              else:
+                  lines = [f"📋 {TODAY} AI 遠端職缺日報\n"]
+                  lines.append(f"共找到 {len(all_jobs)} 筆相關職缺：\n")
+                  for i, (_, job) in enumerate(all_jobs.items(), 1):
+                      lines.append(f"{i}. **{job['name']}** - {job['company']}")
+                      lines.append(f"   💰 {job['salary']}")
+                      lines.append(f"   🔗 {job['link']}")
+                      lines.append("")
+                  message = "\n".join(lines)
+
+              print(f"\n=== 最終訊息 ===\n{message}\n")
+              send_discord(message)
+              print("Discord 通知已發送！")
+
+          asyncio.run(main())
+          PYTHON
